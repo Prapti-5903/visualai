@@ -1,483 +1,315 @@
 /**
- * aslClassifier.js — Improved ASL A–Z Classifier
+ * aslClassifier.js — VisualAI ASL Classifier v3.0
  *
- * Uses a scoring system with multiple features per letter:
- * - Finger extension ratios
- * - Joint angles
- * - Thumb position
- * - Inter-finger distances
- * - Palm orientation
+ * Dual-mode operation:
+ *   1. TRAINED MODE  — loads asl_knn_model.json produced by train_model.py
+ *                      and classifies using real KNN over your recorded data
+ *   2. FALLBACK MODE — uses the geometric rule-based scorer (v2) if no
+ *                      trained model is found or while it's loading
  *
- * Each letter has a weighted multi-feature score for higher accuracy.
+ * The switch between modes is automatic — nothing to configure.
  */
 
-// ── Geometry Helpers ──────────────────────────────────────────────────────────
+// ── KNN Model State ───────────────────────────────────────────────────────────
 
-function dist(a, b) {
-  return Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2 + (a.z-b.z)**2);
-}
-
-function dist2D(a, b) {
-  return Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2);
-}
-
-function dot(a, b) {
-  return a.x*b.x + a.y*b.y;
-}
-
-function angleBetween(a, b, c) {
-  const v1 = { x: a.x-b.x, y: a.y-b.y };
-  const v2 = { x: c.x-b.x, y: c.y-b.y };
-  const d  = dot(v1,v2);
-  const m  = Math.sqrt(v1.x**2+v1.y**2) * Math.sqrt(v2.x**2+v2.y**2);
-  if (m < 1e-9) return 0;
-  return Math.acos(Math.max(-1, Math.min(1, d/m))) * 180 / Math.PI;
-}
-
-// ── Normalise Landmarks ───────────────────────────────────────────────────────
-
-function normaliseLandmarks(lm) {
-  const w   = lm[0];
-  const ref = dist(lm[0], lm[9]) || 1;
-  return lm.map(p => ({
-    x: (p.x - w.x) / ref,
-    y: (p.y - w.y) / ref,
-    z: (p.z - w.z) / ref,
-  }));
-}
-
-// ── Feature Extraction ────────────────────────────────────────────────────────
-
-function extractFeatures(rawLm) {
-  const lm    = normaliseLandmarks(rawLm);
-  const wrist = lm[0];
-
-  // Landmark indices
-  // Thumb:  1(CMC) 2(MCP) 3(IP)  4(TIP)
-  // Index:  5(MCP) 6(PIP) 7(DIP) 8(TIP)
-  // Middle: 9(MCP) 10(PIP) 11(DIP) 12(TIP)
-  // Ring:   13(MCP) 14(PIP) 15(DIP) 16(TIP)
-  // Pinky:  17(MCP) 18(PIP) 19(DIP) 20(TIP)
-
-  const tips = [4,  8,  12, 16, 20];
-  const pips = [3,  7,  11, 15, 19];
-  const dips = [2,  6,  10, 14, 18];
-  const mcps = [1,  5,   9, 13, 17];
-
-  // Distance from wrist
-  const tipD = tips.map(i => dist(lm[i], wrist));
-  const pipD = pips.map(i => dist(lm[i], wrist));
-  const dipD = dips.map(i => dist(lm[i], wrist));
-  const mcpD = mcps.map(i => dist(lm[i], wrist));
-
-  // Extension ratio: >1 = extended, <1 = curled
-  const extRatio = tipD.map((d,i) => d / (pipD[i] + 1e-6));
-
-  // Binary extension (threshold 1.0)
-  const ext = extRatio.map(r => r > 1.0 ? 1 : 0);
-
-  // Curl amount (0=straight, 1=fully curled)
-  const curl = tipD.map((d,i) => Math.max(0, Math.min(1, 1 - d/(pipD[i]+1e-6))));
-
-  // Joint angles for each finger
-  const angles = {
-    thumbIP:   angleBetween(lm[2], lm[3], lm[4]),
-    indexPIP:  angleBetween(lm[5], lm[6], lm[7]),
-    indexDIP:  angleBetween(lm[6], lm[7], lm[8]),
-    middlePIP: angleBetween(lm[9], lm[10], lm[11]),
-    ringPIP:   angleBetween(lm[13], lm[14], lm[15]),
-    pinkyPIP:  angleBetween(lm[17], lm[18], lm[19]),
-  };
-
-  // Key distances
-  const thumbIdx  = dist(lm[4], lm[8]);
-  const thumbMid  = dist(lm[4], lm[12]);
-  const thumbRng  = dist(lm[4], lm[16]);
-  const thumbPnk  = dist(lm[4], lm[20]);
-  const idxMid    = dist(lm[8], lm[12]);
-  const midRng    = dist(lm[12], lm[16]);
-  const rngPnk    = dist(lm[16], lm[20]);
-  const idxRng    = dist(lm[8], lm[16]);
-  const idxPnk    = dist(lm[8], lm[20]);
-
-  // Thumb tip relative to hand
-  const tx = lm[4].x, ty = lm[4].y, tz = lm[4].z;
-
-  // Index tip direction
-  const ix = lm[8].x, iy = lm[8].y;
-
-  // Thumb MCP position
-  const tmcpX = lm[2].x, tmcpY = lm[2].y;
-
-  // Palm normal (up/down facing)
-  const palmY = lm[9].y - lm[0].y; // positive = palm facing down
-
-  // Thumb above/below index MCP
-  const thumbAboveIdxMCP = ty < lm[5].y;
-  const thumbBelowIdxMCP = ty > lm[5].y;
-
-  // All fingers folded / extended
-  const allFolded   = ext[1]===0 && ext[2]===0 && ext[3]===0 && ext[4]===0;
-  const allExtended = ext[1]===1 && ext[2]===1 && ext[3]===1 && ext[4]===1;
-
-  // Spread between fingers
-  const fingersSpread = idxMid + midRng + rngPnk;
-
-  return {
-    lm, ext, curl, extRatio, angles,
-    thumbIdx, thumbMid, thumbRng, thumbPnk,
-    idxMid, midRng, rngPnk, idxRng, idxPnk,
-    tx, ty, tz, ix, iy,
-    tmcpX, tmcpY,
-    palmY, thumbAboveIdxMCP, thumbBelowIdxMCP,
-    allFolded, allExtended, fingersSpread,
-    tipD, pipD, dipD, mcpD,
-  };
-}
-
-// ── Letter Scoring Functions ───────────────────────────────────────────────────
-// Returns score 0..1. Higher = better match.
-
-function scoreA(f) {
-  // Fist, all fingers folded, thumb on side of index (not tucked under)
-  let s = 0;
-  if (f.allFolded)                          s += 0.35;
-  if (f.tx > 0.10 && f.tx < 0.45)          s += 0.25; // thumb to the side
-  if (f.ty < f.lm[6].y)                    s += 0.20; // thumb above PIP of index
-  if (f.thumbIdx > 0.20 && f.thumbIdx < 0.55) s += 0.20; // thumb not touching index tip
-  return s;
-}
-
-function scoreB(f) {
-  // All 4 fingers straight up, thumb tucked across palm
-  let s = 0;
-  if (f.ext[1] && f.ext[2] && f.ext[3] && f.ext[4]) s += 0.40;
-  if (f.tx < -0.05)                                   s += 0.25; // thumb tucked inward
-  if (f.idxMid < 0.40 && f.midRng < 0.40)            s += 0.20; // fingers close together
-  if (f.angles.indexPIP > 150)                        s += 0.15; // index straight
-  return s;
-}
-
-function scoreC(f) {
-  // All fingers curved in C shape, gap between thumb and index
-  let s = 0;
-  const allCurled = f.curl[1]>0.15 && f.curl[1]<0.70 &&
-                    f.curl[2]>0.15 && f.curl[2]<0.70 &&
-                    f.curl[3]>0.15 && f.curl[3]<0.70;
-  if (allCurled)                            s += 0.35;
-  if (f.thumbIdx > 0.40 && f.thumbIdx < 1.2) s += 0.25; // gap between thumb and index
-  if (f.tx > 0.05)                          s += 0.20; // thumb curves outward
-  if (!f.ext[1] && !f.ext[2])              s += 0.20; // fingers not fully extended
-  return s;
-}
-
-function scoreD(f) {
-  // Index up, thumb touches middle, others folded
-  let s = 0;
-  if (f.ext[1])                             s += 0.30; // index up
-  if (!f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.25; // others folded
-  if (f.thumbMid < 0.35)                   s += 0.30; // thumb touches middle
-  if (f.thumbIdx > 0.35)                   s += 0.15; // thumb NOT touching index
-  return s;
-}
-
-function scoreE(f) {
-  // All fingers curled like claws, thumb tucked under
-  let s = 0;
-  if (f.curl[1]>0.40 && f.curl[2]>0.40 && f.curl[3]>0.40 && f.curl[4]>0.40) s += 0.40;
-  if (f.tx < 0.15)                          s += 0.20; // thumb tucked under
-  if (f.angles.indexPIP < 120)              s += 0.20; // index strongly bent
-  if (f.angles.middlePIP < 120)             s += 0.20; // middle strongly bent
-  return s;
-}
-
-function scoreF(f) {
-  // Index+thumb circle, middle+ring+pinky up
-  let s = 0;
-  if (f.ext[2] && f.ext[3] && f.ext[4])    s += 0.35; // mid+ring+pinky up
-  if (f.thumbIdx < 0.30)                   s += 0.35; // thumb touches index
-  if (!f.ext[1])                            s += 0.30; // index folded down
-  return s;
-}
-
-function scoreG(f) {
-  // Index pointing sideways, thumb parallel, others folded
-  let s = 0;
-  if (f.ext[1] && !f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.30;
-  if (Math.abs(f.iy) < 0.45)               s += 0.30; // index horizontal
-  if (f.ix > 0.25)                         s += 0.25; // index pointing sideways
-  if (f.thumbIdx < 0.60)                   s += 0.15; // thumb near index
-  return s;
-}
-
-function scoreH(f) {
-  // Index + middle pointing sideways together
-  let s = 0;
-  if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.30;
-  if (Math.abs(f.iy) < 0.50)               s += 0.25; // horizontal
-  if (f.idxMid < 0.35)                     s += 0.25; // fingers together
-  if (f.ix > 0.20)                         s += 0.20; // pointing sideways
-  return s;
-}
-
-function scoreI(f) {
-  // Only pinky extended, no thumb
-  let s = 0;
-  if (!f.ext[1] && !f.ext[2] && !f.ext[3] && f.ext[4]) s += 0.50;
-  if (!f.ext[0])                            s += 0.25; // thumb not extended
-  if (f.curl[1] > 0.40 && f.curl[2] > 0.40) s += 0.25; // index+middle curled
-  return s;
-}
-
-function scoreJ(f) {
-  // Pinky up + thumb extended (I with thumb out)
-  let s = 0;
-  if (!f.ext[1] && !f.ext[2] && !f.ext[3] && f.ext[4]) s += 0.40;
-  if (f.ext[0] && f.tx > 0.25)             s += 0.35; // thumb extended sideways
-  if (f.curl[1] > 0.35)                    s += 0.25; // index curled
-  return s;
-}
-
-function scoreK(f) {
-  // Index + middle up spread, thumb between them pointing up
-  let s = 0;
-  if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.30;
-  if (f.idxMid > 0.30)                     s += 0.20; // fingers spread
-  if (f.thumbIdx < 0.55 && f.thumbMid < 0.55) s += 0.25; // thumb between fingers
-  if (f.ty < 0)                            s += 0.25; // thumb pointing up
-  return s;
-}
-
-function scoreL(f) {
-  // L shape: index up, thumb out sideways
-  let s = 0;
-  if (f.ext[1] && !f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.30;
-  if (f.ext[0] && f.tx > 0.38)             s += 0.35; // thumb far to the side
-  if (f.thumbIdx > 0.55)                   s += 0.20; // clear gap (L angle)
-  if (f.curl[2] > 0.35)                    s += 0.15; // middle folded
-  return s;
-}
-
-function scoreM(f) {
-  // Three fingers (idx+mid+rng) folded over tucked thumb
-  let s = 0;
-  if (f.curl[1]>0.45 && f.curl[2]>0.45 && f.curl[3]>0.45) s += 0.35;
-  if (f.curl[4] < 0.50)                    s += 0.15; // pinky less curled
-  if (f.thumbIdx < 0.50)                   s += 0.20; // thumb tucked under
-  if (f.ty > f.lm[5].y)                   s += 0.20; // thumb below index MCP
-  if (f.tx < 0.20)                         s += 0.10; // thumb not sticking out
-  return s;
-}
-
-function scoreN(f) {
-  // Two fingers (idx+mid) folded over tucked thumb
-  let s = 0;
-  if (f.curl[1]>0.45 && f.curl[2]>0.45)   s += 0.30;
-  if (f.curl[3] < 0.45 && f.curl[4] < 0.45) s += 0.20; // ring+pinky less curled
-  if (f.thumbIdx < 0.50)                   s += 0.20; // thumb tucked
-  if (f.ty > f.lm[5].y)                   s += 0.20; // thumb below index MCP
-  if (f.tx < 0.20)                         s += 0.10; // thumb not sticking out
-  return s;
-}
-
-function scoreO(f) {
-  // All fingertips touch thumb — closed O
-  let s = 0;
-  if (f.thumbIdx < 0.35)                   s += 0.30; // thumb meets index
-  if (f.thumbMid < 0.45)                   s += 0.20; // thumb near middle
-  if (f.curl[1]>0.25 && f.curl[2]>0.25 && f.curl[3]>0.25) s += 0.30;
-  if (f.thumbIdx > 0.05)                   s += 0.20; // not completely flat
-  return s;
-}
-
-function scoreP(f) {
-  // Like K but rotated — fingers pointing downward
-  let s = 0;
-  if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.30;
-  if (f.iy > 0.25 && f.lm[12].y > 0.25)  s += 0.35; // fingers pointing down
-  if (f.thumbIdx < 0.55)                   s += 0.20; // thumb between fingers
-  if (f.ty > 0)                            s += 0.15; // thumb also pointing down
-  return s;
-}
-
-function scoreQ(f) {
-  // Like G but rotated — index + thumb pointing downward
-  let s = 0;
-  if (f.ext[1] && !f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.25;
-  if (f.iy > 0.35)                         s += 0.30; // index pointing down
-  if (f.thumbIdx < 0.40)                   s += 0.25; // thumb close to index
-  if (f.ty > 0.30)                         s += 0.20; // thumb also down
-  return s;
-}
-
-function scoreR(f) {
-  // Index + middle crossed (very close together)
-  let s = 0;
-  if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.35;
-  if (f.idxMid < 0.20)                     s += 0.40; // very close together (crossed)
-  if (f.curl[3] > 0.30 && f.curl[4] > 0.30) s += 0.25; // ring+pinky folded
-  return s;
-}
-
-function scoreS(f) {
-  // Tight fist, thumb wraps over front of fingers
-  let s = 0;
-  if (f.allFolded)                          s += 0.35;
-  if (f.tx < 0.10)                         s += 0.25; // thumb across front
-  if (f.ty < f.lm[6].y)                   s += 0.25; // thumb at knuckle level
-  if (f.curl[1]>0.45 && f.curl[2]>0.45)   s += 0.15; // fingers tightly curled
-  return s;
-}
-
-function scoreT(f) {
-  // Thumb between index and middle (pokes between them)
-  let s = 0;
-  if (f.curl[1]>0.45 && !f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.30;
-  if (f.tx < 0.25)                         s += 0.20; // thumb not sticking far out
-  if (f.ty < f.lm[6].y)                   s += 0.25; // thumb at or above index PIP
-  if (f.thumbIdx < 0.45)                   s += 0.25; // thumb close to index
-  return s;
-}
-
-function scoreU(f) {
-  // Index + middle up, pressed together
-  let s = 0;
-  if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.35;
-  if (f.idxMid < 0.28)                     s += 0.40; // fingers CLOSE together
-  if (f.curl[3] > 0.30 && f.curl[4] > 0.30) s += 0.25; // ring+pinky folded
-  return s;
-}
-
-function scoreV(f) {
-  // Index + middle up, spread apart (peace sign)
-  let s = 0;
-  if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.35;
-  if (f.idxMid > 0.38)                     s += 0.40; // fingers SPREAD apart
-  if (f.curl[3] > 0.30 && f.curl[4] > 0.30) s += 0.25; // ring+pinky folded
-  return s;
-}
-
-function scoreW(f) {
-  // Index + middle + ring up, spread
-  let s = 0;
-  if (f.ext[1] && f.ext[2] && f.ext[3] && !f.ext[4]) s += 0.50;
-  if (f.idxMid > 0.20 && f.midRng > 0.20) s += 0.30; // spread apart
-  if (f.curl[4] > 0.25)                   s += 0.20; // pinky folded
-  return s;
-}
-
-function scoreX(f) {
-  // Index finger hooked (bent at middle joint)
-  let s = 0;
-  if (f.curl[1]>0.25 && f.curl[1]<0.72)   s += 0.35; // index half-curled
-  if (!f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.30; // others folded
-  if (f.angles.indexPIP < 150 && f.angles.indexPIP > 80) s += 0.35; // bent at PIP
-  return s;
-}
-
-function scoreY(f) {
-  // Thumb + pinky out, others folded (hang loose)
-  let s = 0;
-  if (!f.ext[1] && !f.ext[2] && !f.ext[3] && f.ext[4]) s += 0.35;
-  if (f.ext[0] && f.tx > 0.28)             s += 0.35; // thumb extended sideways
-  if (f.curl[1]>0.30 && f.curl[2]>0.30)   s += 0.30; // index+middle folded
-  return s;
-}
-
-function scoreZ(f) {
-  // Index pointing (like D but no thumb contact) — motion sign
-  let s = 0;
-  if (f.ext[1] && !f.ext[2] && !f.ext[3] && !f.ext[4]) s += 0.40;
-  if (!f.ext[0])                            s += 0.25; // thumb not out
-  if (f.thumbIdx > 0.40)                   s += 0.20; // thumb not touching index
-  if (f.thumbMid > 0.40)                   s += 0.15; // thumb not touching middle
-  return s;
-}
-
-// ── All Scorers ───────────────────────────────────────────────────────────────
-
-const SCORERS = {
-  A: scoreA, B: scoreB, C: scoreC, D: scoreD, E: scoreE,
-  F: scoreF, G: scoreG, H: scoreH, I: scoreI, J: scoreJ,
-  K: scoreK, L: scoreL, M: scoreM, N: scoreN, O: scoreO,
-  P: scoreP, Q: scoreQ, R: scoreR, S: scoreS, T: scoreT,
-  U: scoreU, V: scoreV, W: scoreW, X: scoreX, Y: scoreY,
-  Z: scoreZ,
-};
-
-// Minimum confidence threshold — raise this for stricter detection
-const MIN_CONFIDENCE = 0.62;
-
-// ── Temporal Smoothing ────────────────────────────────────────────────────────
-// Keeps a rolling window of recent predictions to reduce flickering
-
-const HISTORY_SIZE  = 5;
-const letterHistory = [];
-
-function smoothPrediction(letter, confidence) {
-  letterHistory.push({ letter, confidence });
-  if (letterHistory.length > HISTORY_SIZE) letterHistory.shift();
-
-  // Count votes for each letter in history
-  const votes = {};
-  for (const h of letterHistory) {
-    if (!votes[h.letter]) votes[h.letter] = { count:0, totalConf:0 };
-    votes[h.letter].count++;
-    votes[h.letter].totalConf += h.confidence;
-  }
-
-  // Pick letter with most votes (majority wins)
-  let bestLetter = null, bestVotes = 0, bestConf = 0;
-  for (const [l, v] of Object.entries(votes)) {
-    if (v.count > bestVotes || (v.count === bestVotes && v.totalConf > bestConf)) {
-      bestVotes  = v.count;
-      bestConf   = v.totalConf / v.count;
-      bestLetter = l;
-    }
-  }
-
-  return { letter: bestLetter, confidence: bestConf };
-}
-
-// ── Main Export ───────────────────────────────────────────────────────────────
+let _knnModel = null;        // { X: float32[][], y: string[], k: number }
+let _modelLoading = false;
+let _modelLoaded = false;
+let _modelError = null;
 
 /**
- * Classify ASL letter from MediaPipe hand landmarks.
- * @param {Array} landmarks  - 21 {x,y,z} objects from MediaPipe
- * @returns {{ letter: string, confidence: number, allScores: object } | null}
+ * Attempt to load the trained KNN model from the public folder.
+ * Call this once on app startup (or it will be called lazily).
  */
-export function classifyASL(landmarks) {
-  if (!landmarks || landmarks.length < 21) return null;
+export async function loadTrainedModel(url = "/asl_knn_model.json") {
+  if (_modelLoaded || _modelLoading) return;
+  _modelLoading = true;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data.X || !data.y || !data.k) throw new Error("Invalid model format");
 
-  const features   = extractFeatures(landmarks
+    _knnModel = {
+      X: data.X.map(row => new Float32Array(row)),
+      y: data.y,
+      k: data.k ?? 5,
+      classes: data.classes ?? [...new Set(data.y)].sort(),
+    };
+    _modelLoaded = true;
+    console.log(`[VisualAI] Trained KNN model loaded: ${data.y.length} training vectors, k=${data.k}`);
+  } catch (e) {
+    _modelError = e.message;
+    console.warn(`[VisualAI] Trained model not found (${e.message}) — using geometric classifier`);
+  } finally {
+    _modelLoading = false;
+  }
+}
 
-  );
-  const allScores  = {};
-  let bestLetter   = null;
-  let bestScore    = MIN_CONFIDENCE;
+export function isModelLoaded() { return _modelLoaded; }
+export function getModelError() { return _modelError; }
 
-  for (const [letter, scoreFn] of Object.entries(SCORERS)) {
-    const score     = Math.min(1, scoreFn(features));
-    allScores[letter] = score;
-    if (score > bestScore) {
-      bestScore  = score;
-      bestLetter = letter;
-    }
+// ── Feature Extraction (shared by both modes) ─────────────────────────────────
+
+function dist3(a, b) {
+  const dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/**
+ * Normalise 21 MediaPipe landmarks into a 63-dim float vector.
+ * Matches exactly what train_model.py does in Python.
+ */
+function landmarksToFeatureVector(landmarks) {
+  // Convert [{x,y,z}] → [[x,y,z]]
+  const pts = landmarks.map(p => [p.x, p.y, p.z]);
+
+  // Translate wrist to origin
+  const wx = pts[0][0], wy = pts[0][1], wz = pts[0][2];
+  for (let i = 0; i < 21; i++) {
+    pts[i][0] -= wx; pts[i][1] -= wy; pts[i][2] -= wz;
   }
 
-  if (!bestLetter) return null;
+  // Scale by palm length (wrist → middle MCP = lm[9])
+  const scale = dist3(pts[0], pts[9]) || 1;
+  for (let i = 0; i < 21; i++) {
+    pts[i][0] /= scale; pts[i][1] /= scale; pts[i][2] /= scale;
+  }
 
-  // Apply temporal smoothing
-  const smoothed = smoothPrediction(bestLetter, bestScore);
+  // Flatten to 63-dim vector
+  const vec = new Float32Array(63);
+  for (let i = 0; i < 21; i++) {
+    vec[i * 3] = pts[i][0];
+    vec[i * 3 + 1] = pts[i][1];
+    vec[i * 3 + 2] = pts[i][2];
+  }
+  return vec;
+}
+
+// ── KNN Inference ─────────────────────────────────────────────────────────────
+
+function euclideanSq(a, b) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d * d; }
+  return s;
+}
+
+function knnPredict(vec) {
+  const { X, y, k } = _knnModel;
+  const n = X.length;
+
+  // Compute distances to all training vectors
+  const dists = new Array(n);
+  for (let i = 0; i < n; i++) {
+    dists[i] = { d: euclideanSq(vec, X[i]), label: y[i] };
+  }
+
+  // Partial sort — only need k smallest
+  dists.sort((a, b) => a.d - b.d);
+  const neighbors = dists.slice(0, k);
+
+  // Weighted vote: weight = 1 / (dist + ε)
+  const votes = {};
+  for (const { d, label } of neighbors) {
+    const w = 1 / (Math.sqrt(d) + 1e-6);
+    votes[label] = (votes[label] || 0) + w;
+  }
+
+  // Best letter
+  let bestLetter = null, bestWeight = 0;
+  for (const [l, w] of Object.entries(votes)) {
+    if (w > bestWeight) { bestWeight = w; bestLetter = l; }
+  }
+
+  // Confidence: fraction of total vote weight
+  const totalW = Object.values(votes).reduce((s, w) => s + w, 0);
+  const confidence = totalW > 0 ? bestWeight / totalW : 0;
+
+  return { letter: bestLetter, confidence };
+}
+
+function mirrorLandmarks(landmarks) {
+  const wrist = landmarks[0];
+  return landmarks.map(p => ({ x: wrist.x - (p.x - wrist.x), y: p.y, z: p.z }));
+}
+
+function knnPredictLandmarks(landmarks) {
+  const original = knnPredict(landmarksToFeatureVector(landmarks));
+  const mirrored = knnPredict(landmarksToFeatureVector(mirrorLandmarks(landmarks)));
+  return original.confidence >= mirrored.confidence ? original : mirrored;
+}
+
+function scoreGeometricLandmarks(landmarks) {
+  const features = extractFeatures(landmarks);
+  let bestLetter = null;
+  let bestScore = MIN_CONF;
+  const allScores = {};
+
+  for (const [l, scoreFn] of Object.entries(SCORERS)) {
+    const score = clamp(scoreFn(features), 0, 1);
+    allScores[l] = +score.toFixed(3);
+    if (score > bestScore) { bestScore = score; bestLetter = l; }
+  }
+
+  return { letter: bestLetter, confidence: bestScore, allScores };
+}
+
+// ── Geometric Fallback (v2 rule-based) ───────────────────────────────────────
+
+function dist(a, b) {
+  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2);
+}
+function angleBetween(a, b, c) {
+  const v1 = { x: a.x - b.x, y: a.y - b.y }, v2 = { x: c.x - b.x, y: c.y - b.y };
+  const d = v1.x * v2.x + v1.y * v2.y;
+  const m = Math.sqrt(v1.x ** 2 + v1.y ** 2) * Math.sqrt(v2.x ** 2 + v2.y ** 2);
+  if (m < 1e-9) return 0;
+  return Math.acos(Math.max(-1, Math.min(1, d / m))) * 180 / Math.PI;
+}
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function normaliseLandmarks(lm) {
+  const wrist = lm[0], scale = dist(lm[0], lm[9]) || 1;
+  return lm.map(p => ({ x: (p.x - wrist.x) / scale, y: (p.y - wrist.y) / scale, z: (p.z - wrist.z) / scale }));
+}
+
+function extractFeatures(rawLm) {
+  const lm = normaliseLandmarks(rawLm);
+  const wrist = lm[0];
+  const TIPS = [4, 8, 12, 16, 20], PIPS = [3, 7, 11, 15, 19];
+  const tipD = TIPS.map(i => dist(lm[i], wrist));
+  const pipD = PIPS.map(i => dist(lm[i], wrist));
+  const extRatio = tipD.map((d, i) => d / (pipD[i] + 1e-6));
+  const ext = extRatio.map(r => r > 1.05 ? 1 : 0);
+  const curl = tipD.map((d, i) => clamp(1 - d / (pipD[i] + 1e-6), 0, 1));
+  const thumbIdx = dist(lm[4], lm[8]), thumbMid = dist(lm[4], lm[12]);
+  const thumbRng = dist(lm[4], lm[16]), thumbPnk = dist(lm[4], lm[20]);
+  const idxMid = dist(lm[8], lm[12]), midRng = dist(lm[12], lm[16]);
+  const rngPnk = dist(lm[16], lm[20]);
+  const tx = lm[4].x, ty = lm[4].y;
+  const ix = lm[8].x, iy = lm[8].y;
+  const mx = lm[12].x, my = lm[12].y;
+  const thumbExtended = extRatio[0] > 1.1;
+  const allFolded = ext[1] === 0 && ext[2] === 0 && ext[3] === 0 && ext[4] === 0;
+  const indexCrossedMiddle = lm[8].x < lm[12].x;
+  const angles = { indexPIP: angleBetween(lm[5], lm[6], lm[7]), middlePIP: angleBetween(lm[9], lm[10], lm[11]) };
   return {
-    letter:     smoothed.letter,
-    confidence: smoothed.confidence,
-    allScores,
+    lm, ext, curl, extRatio, angles, thumbIdx, thumbMid, thumbRng, thumbPnk,
+    idxMid, midRng, rngPnk, tx, ty, ix, iy, mx, my, thumbExtended, allFolded, indexCrossedMiddle
   };
 }
 
-export function resetHistory() {
-  letterHistory.length = 0;
+const SCORERS = {
+  A: f => { let s = 0; if (f.allFolded) s += .30; if (f.tx > .08 && f.tx < .50) s += .25; if (f.ty < f.lm[6].y) s += .15; if (f.thumbIdx > .18 && f.thumbIdx < .60) s += .15; if (f.curl[1] > .40 && f.curl[2] > .40) s += .15; return s; },
+  B: f => { let s = 0; if (f.ext[1] && f.ext[2] && f.ext[3] && f.ext[4]) s += .35; if (f.tx < -.05) s += .25; if (f.idxMid < .40 && f.midRng < .40) s += .20; if (f.angles.indexPIP > 155) s += .10; if (f.iy < -.50) s += .10; return s; },
+  C: f => { let s = 0; const mc = f.curl[1] > .12 && f.curl[1] < .72 && f.curl[2] > .12 && f.curl[2] < .72; if (mc) s += .30; if (f.thumbIdx > .35 && f.thumbIdx < 1.30) s += .25; if (f.tx > .08) s += .20; if (!f.ext[1] && !f.ext[2]) s += .15; return s; },
+  D: f => { let s = 0; if (f.ext[1]) s += .28; if (!f.ext[2] && !f.ext[3] && !f.ext[4]) s += .22; if (f.thumbMid < .38) s += .28; if (f.thumbIdx > .32) s += .12; if (f.iy < -.50) s += .10; return s; },
+  E: f => { let s = 0; if (f.curl[1] > .38 && f.curl[2] > .38 && f.curl[3] > .38 && f.curl[4] > .38) s += .38; if (f.tx < .18) s += .20; if (f.angles.indexPIP < 125) s += .20; if (f.thumbIdx < .38) s += .10; return s; },
+  F: f => { let s = 0; if (f.ext[2] && f.ext[3] && f.ext[4]) s += .35; if (f.thumbIdx < .32) s += .32; if (!f.ext[1]) s += .23; return s; },
+  G: f => { let s = 0; if (f.ext[1] && !f.ext[2] && !f.ext[3] && !f.ext[4]) s += .25; if (Math.abs(f.iy) < .50) s += .28; if (f.ix > .20) s += .22; if (f.thumbIdx < .65) s += .15; return s; },
+  H: f => { let s = 0; if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += .28; if (Math.abs(f.iy) < .52) s += .22; if (f.idxMid < .38) s += .22; if (f.ix > .18) s += .18; return s; },
+  I: f => { let s = 0; if (!f.ext[1] && !f.ext[2] && !f.ext[3] && f.ext[4]) s += .48; if (!f.thumbExtended) s += .22; if (f.curl[1] > .38 && f.curl[2] > .38) s += .20; return s; },
+  J: f => { let s = 0; if (!f.ext[1] && !f.ext[2] && !f.ext[3] && f.ext[4]) s += .38; if (f.thumbExtended && f.tx > .22) s += .32; if (f.curl[1] > .32) s += .20; return s; },
+  K: f => { let s = 0; if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += .28; if (f.idxMid > .28) s += .18; if (f.thumbIdx < .58 && f.thumbMid < .58) s += .24; if (f.ty < -.05) s += .18; return s; },
+  L: f => { let s = 0; if (f.ext[1] && !f.ext[2] && !f.ext[3] && !f.ext[4]) s += .28; if (f.thumbExtended && f.tx > .40) s += .32; if (f.thumbIdx > .55) s += .18; return s; },
+  M: f => { let s = 0; if (f.curl[1] > .42 && f.curl[2] > .42 && f.curl[3] > .42) s += .32; if (f.thumbIdx < .52) s += .20; if (f.ty > f.lm[5].y) s += .18; return s; },
+  N: f => { let s = 0; if (f.curl[1] > .42 && f.curl[2] > .42) s += .28; if (f.curl[3] < .48 && f.curl[4] < .48) s += .20; if (f.thumbIdx < .52) s += .20; return s; },
+  O: f => { let s = 0; if (f.thumbIdx < .38) s += .28; if (f.thumbMid < .50) s += .18; if (f.curl[1] > .22 && f.curl[2] > .22 && f.curl[3] > .22) s += .28; return s; },
+  P: f => { let s = 0; if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += .28; if (f.iy > .22) s += .32; if (f.thumbIdx < .58) s += .20; return s; },
+  Q: f => { let s = 0; if (f.ext[1] && !f.ext[2] && !f.ext[3] && !f.ext[4]) s += .22; if (f.iy > .32) s += .28; if (f.thumbIdx < .42) s += .24; return s; },
+  R: f => { let s = 0; if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += .32; if (f.idxMid < .22) s += .38; if (f.curl[3] > .28 && f.curl[4] > .28) s += .20; return s; },
+  S: f => { let s = 0; if (f.allFolded) s += .32; if (f.tx < .12) s += .25; if (f.ty < f.lm[6].y) s += .22; return s; },
+  T: f => { let s = 0; if (f.curl[1] > .42 && !f.ext[2] && !f.ext[3] && !f.ext[4]) s += .28; if (f.thumbIdx < .48) s += .22; return s; },
+  U: f => { let s = 0; if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += .33; if (f.idxMid < .26) s += .38; return s; },
+  V: f => { let s = 0; if (f.ext[1] && f.ext[2] && !f.ext[3] && !f.ext[4]) s += .33; if (f.idxMid > .36) s += .38; return s; },
+  W: f => { let s = 0; if (f.ext[1] && f.ext[2] && f.ext[3] && !f.ext[4]) s += .48; if (f.idxMid > .18 && f.midRng > .18) s += .28; return s; },
+  X: f => { let s = 0; if (f.curl[1] > .22 && f.curl[1] < .75) s += .32; if (!f.ext[2] && !f.ext[3] && !f.ext[4]) s += .28; if (f.angles.indexPIP < 152 && f.angles.indexPIP > 75) s += .30; return s; },
+  Y: f => { let s = 0; if (!f.ext[1] && !f.ext[2] && !f.ext[3] && f.ext[4]) s += .33; if (f.thumbExtended && f.tx > .25) s += .33; if (f.curl[1] > .28 && f.curl[2] > .28) s += .26; return s; },
+  Z: f => { let s = 0; if (f.ext[1] && !f.ext[2] && !f.ext[3] && !f.ext[4]) s += .38; if (!f.thumbExtended) s += .22; if (f.thumbIdx > .38) s += .20; return s; },
+};
+
+const MIN_CONF = 0.62;
+
+// ── Temporal Smoothing ────────────────────────────────────────────────────────
+
+const HISTORY_SIZE = 6;
+const _history = [];
+
+function smoothPrediction(letter, confidence) {
+  _history.push({ letter, confidence });
+  if (_history.length > HISTORY_SIZE) _history.shift();
+
+  const votes = {};
+  _history.forEach(({ letter: l, confidence: c }, idx) => {
+    const w = (idx + 1) / _history.length;
+    votes[l] = (votes[l] || 0) + w * c;
+  });
+
+  let bestLetter = null, bestWeight = 0;
+  for (const [l, w] of Object.entries(votes)) {
+    if (w > bestWeight) { bestWeight = w; bestLetter = l; }
+  }
+
+  const hits = _history.filter(h => h.letter === bestLetter);
+  const avgConf = hits.reduce((s, h) => s + h.confidence, 0) / hits.length;
+  return { letter: bestLetter, confidence: avgConf };
 }
 
+// ── Main Export ────────────────────────────────────────────────────────────────
+
+/**
+ * Classify ASL letter from 21 MediaPipe hand landmarks.
+ * Auto-selects trained KNN model (if loaded) or geometric fallback.
+ *
+ * @param {Array}   landmarks - Array of 21 {x,y,z} from MediaPipe
+ * @param {boolean} debug     - If true, includes allScores in result
+ */
+export function classifyASL(landmarks, debug = false) {
+  if (!landmarks || landmarks.length < 21) return null;
+
+  let letter = null, confidence = 0;
+  let mode = "geometric";
+  let allScores = {};
+
+  let knnResult = null;
+  if (_modelLoaded && _knnModel) {
+    try {
+      knnResult = knnPredictLandmarks(landmarks);
+    } catch (e) {
+      knnResult = null;
+    }
+  }
+
+  const originalGeo = scoreGeometricLandmarks(landmarks);
+  const mirroredGeo = scoreGeometricLandmarks(mirrorLandmarks(landmarks));
+  const geoResult = originalGeo.confidence >= mirroredGeo.confidence ? originalGeo : mirroredGeo;
+
+  if (knnResult && knnResult.confidence >= MIN_CONF && knnResult.confidence >= geoResult.confidence) {
+    letter = knnResult.letter;
+    confidence = knnResult.confidence;
+    mode = "knn";
+  } else if (geoResult.confidence >= MIN_CONF) {
+    letter = geoResult.letter;
+    confidence = geoResult.confidence;
+    allScores = geoResult.allScores;
+    mode = "geometric";
+  } else {
+    return null;
+  }
+
+  if (!letter) return null;
+
+  const smoothed = smoothPrediction(letter, confidence);
+  return {
+    letter: smoothed.letter,
+    confidence: +smoothed.confidence.toFixed(3),
+    mode,
+    ...(debug ? { allScores } : {}),
+  };
+}
+
+export function resetHistory() { _history.length = 0; }
 export { normaliseLandmarks, extractFeatures };
+
+// Try loading model immediately on module load
+loadTrainedModel().catch(() => { });
